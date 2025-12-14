@@ -1,0 +1,235 @@
+"""
+Training configuration and experiment models.
+Maps to SPECS.md Section 6.2: training_configs, experiment_runs,
+experiment_logs, experiment_ticker_artifacts
+"""
+
+import uuid
+from enum import Enum
+
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    Column,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.orm import relationship
+
+from app.db.base import Base, TimestampMixin
+
+
+class TrainingConfig(Base, TimestampMixin):
+    """
+    Versioned configuration blobs for training.
+    Includes stock universe, data window, indicators, targets,
+    models, ensemble, and reproducibility settings.
+    """
+
+    __tablename__ = "training_configs"
+    __table_args__ = (
+        UniqueConstraint("owner_user_id", "name", "version", name="uq_config_version"),
+        Index("idx_training_configs_owner_active", "owner_user_id", "is_active"),
+    )
+
+    id = Column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    owner_user_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    name = Column(String(100), nullable=False)
+    description = Column(Text, nullable=True)
+    config = Column(JSONB, nullable=False)
+    version = Column(Integer, default=1, nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+
+    # Relationships
+    owner = relationship(
+        "User",
+        back_populates="training_configs",
+        foreign_keys=[owner_user_id],
+    )
+    experiment_runs = relationship(
+        "ExperimentRun",
+        back_populates="config",
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<TrainingConfig(id={self.id}, name={self.name}, version={self.version})>"
+        )
+
+
+class ExperimentState(str, Enum):
+    """Experiment run state enumeration."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCESS = "success"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class ExperimentRun(Base):
+    """
+    Individual training runs.
+    """
+
+    __tablename__ = "experiment_runs"
+    __table_args__ = (
+        Index("idx_experiment_runs_state_created", "state", "created_at"),
+    )
+
+    id = Column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    config_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("training_configs.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    owner_user_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    scope = Column(String(50), nullable=True)
+    state = Column(
+        String(20),
+        nullable=False,
+        default=ExperimentState.PENDING.value,
+    )
+    progress_pct = Column(Numeric(5, 2), nullable=True)
+    eta = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    started_at = Column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    finished_at = Column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    notes = Column(Text, nullable=True)
+    summary_metrics = Column(JSONB, nullable=True)
+
+    # Relationships
+    config = relationship(
+        "TrainingConfig",
+        back_populates="experiment_runs",
+    )
+    owner = relationship(
+        "User",
+        back_populates="experiment_runs",
+        foreign_keys=[owner_user_id],
+    )
+    logs = relationship(
+        "ExperimentLog",
+        back_populates="run",
+        cascade="all, delete-orphan",
+    )
+    ticker_artifacts = relationship(
+        "ExperimentTickerArtifact",
+        back_populates="run",
+        cascade="all, delete-orphan",
+    )
+
+    def __repr__(self) -> str:
+        return f"<ExperimentRun(id={self.id}, state={self.state})>"
+
+
+class ExperimentLog(Base):
+    """
+    Ordered log entries per experiment run.
+    """
+
+    __tablename__ = "experiment_logs"
+    __table_args__ = (Index("idx_experiment_logs_run_ts", "run_id", "ts"),)
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    run_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("experiment_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    ts = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    level = Column(String(20), nullable=False)
+    message = Column(Text, nullable=False)
+
+    # Relationships
+    run = relationship("ExperimentRun", back_populates="logs")
+
+    def __repr__(self) -> str:
+        return f"<ExperimentLog(run_id={self.run_id}, level={self.level})>"
+
+
+class ExperimentTickerArtifact(Base):
+    """
+    Per-run, per-ticker artifact records.
+    Includes metric JSON and URLs to evaluation/future plots,
+    model/scaler binaries, and future_predictions CSVs.
+    
+    run_id is nullable to support Airflow DAG runs which don't have
+    an associated experiment run record.
+    """
+
+    __tablename__ = "experiment_ticker_artifacts"
+    # Unique constraints handled by partial indexes in migration:
+    # - uq_artifact_stock_null_run: (stock_id) WHERE run_id IS NULL
+    # - uq_artifact_run_stock_not_null: (run_id, stock_id) WHERE run_id IS NOT NULL
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    run_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("experiment_runs.id", ondelete="CASCADE"),
+        nullable=True,  # Nullable for Airflow DAG runs
+    )
+    stock_id = Column(
+        BigInteger,
+        ForeignKey("stocks.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    metrics = Column(JSONB, nullable=True)
+    evaluation_png_url = Column(String(500), nullable=True)
+    future_png_url = Column(String(500), nullable=True)
+    model_pkl_url = Column(String(500), nullable=True)
+    scaler_pkl_url = Column(String(500), nullable=True)
+    future_predictions_csv = Column(String(500), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    # Relationships
+    run = relationship("ExperimentRun", back_populates="ticker_artifacts")
+
+    def __repr__(self) -> str:
+        return f"<ExperimentTickerArtifact(run_id={self.run_id}, stock_id={self.stock_id})>"
+
+
+# Forward reference
+from app.db.models.users import User  # noqa: E402, F401
