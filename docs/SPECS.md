@@ -45,13 +45,9 @@
 
 ### 1.1 Members
 
-Group 2 - Intelligent Systems:
+New Trends in ICT:
 
-Nguyễn Viết Vũ
-
-Phan Hoàng Tú
-
-Trần Hoàng Duy
+Phan Hoàng Tú - 2570370
 
 ### 1.2 Purpose
 
